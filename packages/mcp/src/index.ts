@@ -1,7 +1,7 @@
 /**
  * stable-mcp — remote MCP server (MVP)
  *
- * Exposes 5 tools (transfer, bridge, list-chains, balance) over stateful Streamable HTTP,
+ * Exposes 7 tools (transfer, quote-bridge, bridge, list-chains, balance, search-docs, read-doc) over stateful Streamable HTTP,
  * testnet-only, bearer-token auth, single-instance in-memory session store.
  * Conforms to MCP spec 2025-11-25 (lifecycle + Streamable HTTP transport).
  *
@@ -123,7 +123,61 @@ function fail(e: unknown) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tools (5) — registered fresh on each per-session McpServer
+// Docs lookup — rides the published docs (llms.txt index + .md pages). No extra infra.
+// Covers conceptual nuance the action tools can't express (e.g. balance reconciliation).
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DOCS_BASE_URL = (process.env.DOCS_BASE_URL ?? "https://docs.stable.xyz").replace(/\/+$/, "");
+const DOCS_HOST = new URL(DOCS_BASE_URL).host;
+const LLMS_TXT_URL = `${DOCS_BASE_URL}/llms.txt`;
+const DOCS_INDEX_TTL_MS = Number(process.env.DOCS_INDEX_TTL_MS ?? 3_600_000); // 1h
+const DOC_MAX_CHARS = Number(process.env.DOC_MAX_CHARS ?? 50_000);
+
+interface DocEntry {
+  title: string;
+  url: string;
+  description: string;
+}
+let docIndexCache: { entries: DocEntry[]; fetchedAt: number } | undefined;
+
+// Parse llms.txt list lines: "- [Title](url): description".
+const LLMS_LINE = /^- \[([^\]]+)\]\(([^)]+)\)(?::\s*(.*))?$/;
+
+async function loadDocIndex(): Promise<DocEntry[]> {
+  const now = Date.now();
+  if (docIndexCache && now - docIndexCache.fetchedAt < DOCS_INDEX_TTL_MS) return docIndexCache.entries;
+  const res = await fetch(LLMS_TXT_URL);
+  if (!res.ok) throw new Error(`llms.txt fetch failed: HTTP ${res.status}`);
+  const text = await res.text();
+  const entries: DocEntry[] = [];
+  for (const raw of text.split("\n")) {
+    const m = LLMS_LINE.exec(raw.trim());
+    if (m) entries.push({ title: m[1], url: m[2], description: (m[3] ?? "").trim() });
+  }
+  docIndexCache = { entries, fetchedAt: now };
+  return entries;
+}
+
+// Keyword scoring. A page that matches MORE of the distinct query terms should win,
+// even over a page with a single strong (title) hit — so coverage dominates, with
+// title/description weight as the tiebreaker.
+function scoreDoc(entry: DocEntry, terms: string[]): number {
+  const title = entry.title.toLowerCase();
+  const desc = entry.description.toLowerCase();
+  let coverage = 0;
+  let weight = 0;
+  for (const t of terms) {
+    const inTitle = title.includes(t);
+    const inDesc = desc.includes(t);
+    if (inTitle || inDesc) coverage += 1;
+    if (inTitle) weight += 3;
+    else if (inDesc) weight += 1;
+  }
+  return coverage * 10 + weight;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tools — registered fresh on each per-session McpServer
 // ─────────────────────────────────────────────────────────────────────────────
 
 function registerTools(server: McpServer): void {
@@ -356,6 +410,127 @@ function registerTools(server: McpServer): void {
       }
     },
   );
+
+  // stable_search_docs — read-only search over the published docs index (llms.txt)
+  server.registerTool(
+    "stable_search_docs",
+    {
+      title: "Search Stable docs",
+      description:
+        "Search the official Stable documentation for pages relevant to a query. Read-only; no funds move. " +
+        "Use this for behavior and concepts the other tools cannot express — e.g. USDT0 balance reconciliation, " +
+        "dual-role native/ERC-20 quirks, contract-design rules, gas semantics, or bridging internals. " +
+        "Returns ranked results as {title, url, description}; pass a `url` to stable_read_doc to read the full page.",
+      inputSchema: {
+        query: z
+          .string()
+          .min(2)
+          .describe("Keywords describing what you need, e.g. 'balance reconciliation' or 'zero address transfer'."),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(20)
+          .optional()
+          .describe("Max results to return (default 5)."),
+      },
+      outputSchema: {
+        results: z
+          .array(z.object({ title: z.string(), url: z.string(), description: z.string() }))
+          .optional(),
+        code: z.string().optional(),
+        message: z.string().optional(),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ query, limit }) => {
+      try {
+        const entries = await loadDocIndex();
+        const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+        const results = entries
+          .map((e) => ({ e, s: scoreDoc(e, terms) }))
+          .filter((x) => x.s > 0)
+          .sort((a, b) => b.s - a.s)
+          .slice(0, limit ?? 5)
+          .map((x) => x.e);
+        if (results.length === 0) {
+          return ok({ results: [] }, `No docs matched "${query}". Try broader or different keywords.`);
+        }
+        const text = results
+          .map((r) => `- ${r.title} — ${r.url}${r.description ? `: ${r.description}` : ""}`)
+          .join("\n");
+        return ok({ results }, text);
+      } catch (e) {
+        const message = (e as Error)?.message ?? String(e);
+        return ok(
+          { code: "DOCS_UNAVAILABLE", message: `${message} — the docs index could not be loaded; retry shortly.` },
+          `DOCS_UNAVAILABLE: ${message}`,
+        );
+      }
+    },
+  );
+
+  // stable_read_doc — read-only fetch of a single docs page (markdown), host-restricted
+  server.registerTool(
+    "stable_read_doc",
+    {
+      title: "Read a Stable docs page",
+      description:
+        `Fetch the full markdown of a single Stable documentation page. Read-only. ` +
+        `Pass a \`url\` returned by stable_search_docs. Only ${DOCS_HOST} pages over HTTPS are allowed; ` +
+        `the .md form is fetched automatically and pages longer than ${DOC_MAX_CHARS} characters are truncated.`,
+      inputSchema: {
+        url: z
+          .string()
+          .url()
+          .describe(`A docs page URL on https://${DOCS_HOST} (typically from stable_search_docs).`),
+      },
+      outputSchema: {
+        url: z.string().optional(),
+        content: z.string().optional(),
+        truncated: z.boolean().optional(),
+        code: z.string().optional(),
+        message: z.string().optional(),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ url }) => {
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return ok({ code: "INVALID_INPUT", message: `not a valid URL: ${url}` }, `INVALID_INPUT: not a valid URL`);
+      }
+      // Host allowlist: keep this tool a docs reader, not a general fetch primitive.
+      if (parsed.protocol !== "https:" || parsed.host !== DOCS_HOST) {
+        return ok(
+          { code: "INVALID_INPUT", message: `only https://${DOCS_HOST} pages are allowed` },
+          `INVALID_INPUT: host not allowed (${parsed.host})`,
+        );
+      }
+      if (!parsed.pathname.endsWith(".md")) parsed.pathname = `${parsed.pathname}.md`;
+      const target = parsed.toString();
+      try {
+        const res = await fetch(target);
+        if (!res.ok) {
+          return ok(
+            { code: "DOCS_UNAVAILABLE", message: `HTTP ${res.status} fetching ${target}` },
+            `DOCS_UNAVAILABLE: HTTP ${res.status}`,
+          );
+        }
+        let content = await res.text();
+        const truncated = content.length > DOC_MAX_CHARS;
+        if (truncated) content = `${content.slice(0, DOC_MAX_CHARS)}\n\n[truncated]`;
+        return ok({ url: target, content, truncated }, content);
+      } catch (e) {
+        const message = (e as Error)?.message ?? String(e);
+        return ok(
+          { code: "DOCS_UNAVAILABLE", message: `${message} — could not fetch the page; retry shortly.` },
+          `DOCS_UNAVAILABLE: ${message}`,
+        );
+      }
+    },
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -419,7 +594,10 @@ async function createSession(): Promise<StreamableHTTPServerTransport> {
         "2. stable_balance — confirm the wallet has funds before any write.\n" +
         "3. stable_quote_bridge — preview a cross-chain result; re-quote right before bridging.\n" +
         "4. stable_transfer / stable_bridge — execute. For bridges, set `recipient` or the funds land back in this server's wallet; " +
-        "the returned txHash is the source chain only and destination settlement is asynchronous.",
+        "the returned txHash is the source chain only and destination settlement is asynchronous.\n\n" +
+        "When you hit Stable-specific behavior the tools don't capture (e.g. USDT0 balance reconciliation, dual-role native/ERC-20 " +
+        "quirks, contract-design rules, bridging internals), search the official docs with stable_search_docs and read a page with " +
+        "stable_read_doc instead of guessing.",
     },
   );
   registerTools(server);
