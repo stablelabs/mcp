@@ -64,9 +64,19 @@ const BIND_HOST = process.env.HOST ?? "127.0.0.1";
 
 const ADDRESS = z
   .string()
-  .regex(/^0x[0-9a-fA-F]{40}$/, "must be a 0x-prefixed 40-hex address");
-const AMOUNT = z.number().positive();
-const DECIMALS = z.number().int().nonnegative();
+  .regex(/^0x[0-9a-fA-F]{40}$/, "must be a 0x-prefixed 40-hex address")
+  .describe("A 0x-prefixed, 40-hex-character EVM address (e.g. 0xabc...123).");
+const AMOUNT = z
+  .number()
+  .positive()
+  .describe(
+    "Token amount in human-readable units, NOT base units/wei (e.g. 1.5 means 1.5 USDT). The SDK scales by the token's decimals.",
+  );
+const DECIMALS = z
+  .number()
+  .int()
+  .nonnegative()
+  .describe("Token decimals. Omit to let the SDK read it on-chain (USDT0 is 6).");
 
 type ToolOk = Record<string, unknown>;
 
@@ -74,16 +84,41 @@ function ok(structuredContent: ToolOk, text: string) {
   return { structuredContent, content: [{ type: "text" as const, text }] };
 }
 
-/** Map SDK errors to the 5 stable codes. No retry logic. */
+/**
+ * Map SDK errors to the 5 stable codes and an ACTIONABLE message. No retry logic.
+ * The recovery hint goes in the `message` string (structuredContent stays {code, message}
+ * so it keeps validating against each tool's outputSchema).
+ */
 function fail(e: unknown) {
-  let code = "STABLE_ERROR";
-  if (e instanceof StableValidationError) code = "INVALID_INPUT";
-  else if (e instanceof StableQuoteError) code = "QUOTE_FAILED";
-  else if (e instanceof StableTransactionError) code = "TX_REVERTED";
-  else if (e instanceof StableNetworkError) code = "RPC_UNAVAILABLE";
   // viem BaseError (which StableError extends) exposes a concise `shortMessage`.
-  const message =
+  const base =
     (e as { shortMessage?: string })?.shortMessage ?? (e as Error)?.message ?? String(e);
+
+  let code = "STABLE_ERROR";
+  let detail = "";
+  let hint = "Inspect the message; the inputs or network may be at fault.";
+
+  if (e instanceof StableValidationError) {
+    code = "INVALID_INPUT";
+    detail = ` (field: ${e.field}, value: ${JSON.stringify(e.value)})`;
+    hint =
+      "Fix that parameter. For chain values, fromToken/toToken addresses and decimals, call stable_list_chains.";
+  } else if (e instanceof StableQuoteError) {
+    code = "QUOTE_FAILED";
+    if (e.httpStatus) detail = ` (provider: ${e.provider}, status: ${e.httpStatus})`;
+    hint =
+      "The bridge provider could not quote. Verify fromChain/toChain, token addresses and amount, then retry stable_quote_bridge.";
+  } else if (e instanceof StableTransactionError) {
+    code = "TX_REVERTED";
+    detail = ` (phase: ${e.phase}${e.revertReason ? `, revert: ${e.revertReason}` : ""})`;
+    hint =
+      "The transaction did not settle. Check the wallet's funds with stable_balance and confirm the inputs before retrying.";
+  } else if (e instanceof StableNetworkError) {
+    code = "RPC_UNAVAILABLE";
+    hint = "The RPC/network is temporarily unreachable. Wait briefly and retry the same call.";
+  }
+
+  const message = `${base}${detail} — ${hint}`;
   return ok({ code, message }, `${code}: ${message}`);
 }
 
@@ -97,11 +132,19 @@ function registerTools(server: McpServer): void {
     "stable_transfer",
     {
       title: "Transfer USDT",
-      description: "Transfer USDT to an address (testnet). Returns the transaction hash.",
+      description:
+        "Send USDT from THIS server's own wallet to another address on the Stable testnet. " +
+        "The sender is always this server's wallet (custodial) — you cannot choose the sender. " +
+        "This moves real testnet funds and is irreversible; there is no confirmation step. " +
+        "By default it sends native USDT0; pass `token` to send a specific ERC-20 instead. " +
+        "Returns `txHash` (submitted, not necessarily finalized) — verify with stable_balance if needed. " +
+        "On failure, returns a `code` + `message` instead of a hash.",
       inputSchema: {
-        to: ADDRESS,
+        to: ADDRESS.describe("Recipient address that will receive the funds."),
         amount: AMOUNT,
-        token: ADDRESS.optional(),
+        token: ADDRESS.optional().describe(
+          "ERC-20 token contract address to send. Omit to send native USDT0 (the usual case).",
+        ),
         tokenDecimals: DECIMALS.optional(),
       },
       outputSchema: {
@@ -113,7 +156,7 @@ function registerTools(server: McpServer): void {
     },
     async ({ to, amount, token, tokenDecimals }) => {
       try {
-        // ASSUMPTION: TransferParams requires `from`; the shared signer is the sender.
+        // TransferParams.from is required; the shared server signer is always the sender (custodial).
         const res = await stable.transfer({ from: account.address, to, amount, token, tokenDecimals });
         return ok({ txHash: res.txHash }, `transfer submitted: ${res.txHash}`);
       } catch (e) {
@@ -127,16 +170,28 @@ function registerTools(server: McpServer): void {
     "stable_quote_bridge",
     {
       title: "Quote a bridge",
-      description: "Estimate the destination amount for a cross-chain USDT bridge. Read-only.",
+      description:
+        "Estimate how much USDT arrives on the destination chain for a cross-chain bridge, before committing. " +
+        "Read-only: sends no transaction and moves no funds. " +
+        "Call stable_list_chains first to get valid chain values plus each chain's USDT token address and decimals to pass here. " +
+        "Returns the estimated `toAmount` (human-readable, destination side); it may be omitted if the provider can't price it, and it can change, so quote again right before stable_bridge.",
       inputSchema: {
-        // ASSUMPTION: fromChain/toChain are Chain enum *values* (e.g. "ethereum", "stable");
-        // call stable_list_chains for the exact strings to pass.
-        fromChain: z.nativeEnum(Chain),
-        toChain: z.nativeEnum(Chain),
-        fromToken: ADDRESS,
-        toToken: ADDRESS,
+        fromChain: z
+          .nativeEnum(Chain)
+          .describe("Source chain. Must be one of the `name` values from stable_list_chains."),
+        toChain: z
+          .nativeEnum(Chain)
+          .describe("Destination chain. Must be one of the `name` values from stable_list_chains."),
+        fromToken: ADDRESS.describe(
+          "USDT token contract address on the source chain (the `usdt` field from stable_list_chains).",
+        ),
+        toToken: ADDRESS.describe(
+          "USDT token contract address on the destination chain (the `usdt` field from stable_list_chains).",
+        ),
         amount: AMOUNT,
-        fromDecimals: DECIMALS.optional(),
+        fromDecimals: DECIMALS.optional().describe(
+          "Decimals of the source token. Omit to use the SDK default of 6 (USDT0).",
+        ),
       },
       outputSchema: {
         toAmount: z.number().optional(),
@@ -160,15 +215,32 @@ function registerTools(server: McpServer): void {
     "stable_bridge",
     {
       title: "Bridge USDT",
-      description: "Bridge USDT across chains (testnet). Call stable_quote_bridge first. Returns the source-chain transaction hash.",
+      description:
+        "Move USDT from one chain to another, spending from THIS server's own wallet (custodial — you cannot choose the sender). " +
+        "Moves real testnet funds and is irreversible; call stable_quote_bridge first to confirm the expected output. " +
+        "IMPORTANT: if `recipient` is omitted, the funds arrive at THIS server's own wallet on the destination chain — set `recipient` to send them elsewhere. " +
+        "Returns `txHash` for the SOURCE chain only; destination settlement is asynchronous, so the funds will not appear on the destination immediately. " +
+        "On failure, returns a `code` + `message` instead.",
       inputSchema: {
-        fromChain: z.nativeEnum(Chain),
-        toChain: z.nativeEnum(Chain),
-        fromToken: ADDRESS,
-        toToken: ADDRESS,
+        fromChain: z
+          .nativeEnum(Chain)
+          .describe("Source chain. Must be one of the `name` values from stable_list_chains."),
+        toChain: z
+          .nativeEnum(Chain)
+          .describe("Destination chain. Must be one of the `name` values from stable_list_chains."),
+        fromToken: ADDRESS.describe(
+          "USDT token contract address on the source chain (the `usdt` field from stable_list_chains).",
+        ),
+        toToken: ADDRESS.describe(
+          "USDT token contract address on the destination chain (the `usdt` field from stable_list_chains).",
+        ),
         amount: AMOUNT,
-        fromDecimals: DECIMALS.optional(),
-        recipient: ADDRESS.optional(),
+        fromDecimals: DECIMALS.optional().describe(
+          "Decimals of the source token. Omit to use the SDK default of 6 (USDT0).",
+        ),
+        recipient: ADDRESS.optional().describe(
+          "Destination-chain address to receive the funds. Omit ONLY if you intend the funds to land in this server's own wallet.",
+        ),
       },
       outputSchema: {
         txHash: z.string().optional(),
@@ -193,19 +265,37 @@ function registerTools(server: McpServer): void {
     "stable_list_chains",
     {
       title: "List supported chains",
-      description: "List the supported chains and their chain IDs. Use the returned `name` values for fromChain/toChain.",
+      description:
+        "List every supported chain with the exact values needed to build a bridge or quote. " +
+        "Read-only. Call this FIRST when bridging: each entry gives the `name` to pass as fromChain/toChain, " +
+        "the `usdt` token contract address to pass as fromToken/toToken, the `chainId`, and the token `decimals` (for fromDecimals). " +
+        "These are the only valid chain values.",
       outputSchema: {
-        chains: z.array(z.object({ name: z.string(), chainId: z.number() })).optional(),
+        chains: z
+          .array(
+            z.object({
+              name: z.string(),
+              chainId: z.number(),
+              usdt: z.string(),
+              decimals: z.number(),
+            }),
+          )
+          .optional(),
         code: z.string().optional(),
         message: z.string().optional(),
       },
       annotations: { readOnlyHint: true },
     },
     () => {
-      // ASSUMPTION: CHAIN_CONFIGS keys are Chain enum values; ChainConfig.id is the chainId.
+      // CHAIN_CONFIGS keys are Chain enum values; ChainConfig carries id, usdt address, and decimals.
       const chains = Object.entries(CHAIN_CONFIGS)
         .filter((entry): entry is [string, ChainConfig] => !!entry[1])
-        .map(([name, cfg]) => ({ name, chainId: cfg.id }));
+        .map(([name, cfg]) => ({
+          name,
+          chainId: cfg.id,
+          usdt: cfg.usdt,
+          decimals: cfg.decimals,
+        }));
       return ok({ chains }, `${chains.length} chains: ${chains.map((c) => c.name).join(", ")}`);
     },
   );
@@ -216,12 +306,22 @@ function registerTools(server: McpServer): void {
     {
       title: "Read USDT balance",
       description:
-        "Read a wallet's USDT balance on the stable chain (testnet). Defaults to this server's own wallet and the chain's USDT token. Read-only.",
+        "Read a wallet's USDT balance on the Stable chain (testnet). Read-only. " +
+        "With no arguments, returns THIS server's own wallet balance for the chain's USDT0 token — " +
+        "use it to check funds before stable_transfer/stable_bridge or to confirm a transfer landed. " +
+        "Returns `balance` (human-readable string) and `raw` (base units string).\n" +
+        "CAVEAT: USDT0 is dual-role — the native gas asset (18 decimals) and an ERC-20 (6 decimals) over the SAME balance. " +
+        "This reports the ERC-20 view via balanceOf (6 decimals), which can differ from the native balance by up to 0.000001 USDT0 " +
+        "due to fractional reconciliation, so a wallet holding a tiny amount can read as exactly 0 here. " +
+        "Treat this as the ERC-20 balance, not an exact native spendable amount. " +
+        "See docs: https://docs.stable.xyz/en/explanation/usdt0-behavior#balance-reconciliation",
       inputSchema: {
-        // Defaults to the server's signer address.
-        address: ADDRESS.optional(),
-        // Defaults to the stable chain's USDT token.
-        token: ADDRESS.optional(),
+        address: ADDRESS.optional().describe(
+          "Wallet to read. Omit to read this server's own wallet.",
+        ),
+        token: ADDRESS.optional().describe(
+          "ERC-20 token to read. Omit to read the Stable chain's USDT0 token.",
+        ),
         tokenDecimals: DECIMALS.optional(),
       },
       outputSchema: {
@@ -305,7 +405,23 @@ app.use("/mcp", (req: Request, res: Response, next: NextFunction) => {
 
 // One McpServer + transport PER SESSION (not per request). Created on `initialize`.
 async function createSession(): Promise<StreamableHTTPServerTransport> {
-  const server = new McpServer({ name: "stable-mcp", version: "0.1.0" });
+  const server = new McpServer(
+    { name: "stable-mcp", version: "0.1.0" },
+    {
+      instructions:
+        "Tools for moving USDT on the Stable network. TESTNET ONLY — all funds are throwaway testnet funds.\n\n" +
+        "Custody model: this server holds ONE wallet and signs with it. Every write (stable_transfer, stable_bridge) " +
+        "spends from that single server-owned wallet; the caller cannot choose the sender. Treat writes as real, " +
+        "irreversible fund movements with no confirmation step.\n\n" +
+        "Amounts are human-readable (1.5 = 1.5 USDT), never base units. USDT0 has 6 decimals.\n\n" +
+        "Recommended flow:\n" +
+        "1. stable_list_chains — get valid chain names plus each chain's USDT address and decimals (needed for bridging).\n" +
+        "2. stable_balance — confirm the wallet has funds before any write.\n" +
+        "3. stable_quote_bridge — preview a cross-chain result; re-quote right before bridging.\n" +
+        "4. stable_transfer / stable_bridge — execute. For bridges, set `recipient` or the funds land back in this server's wallet; " +
+        "the returned txHash is the source chain only and destination settlement is asynchronous.",
+    },
+  );
   registerTools(server);
   // DNS-rebinding protection (spec MUST): invalid Origin/Host → 403, enforced by the transport.
   const transport = new StreamableHTTPServerTransport({
