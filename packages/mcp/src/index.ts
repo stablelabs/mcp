@@ -23,10 +23,6 @@ import {
   Chain,
   CHAIN_CONFIGS,
   type ChainConfig,
-  StableValidationError,
-  StableQuoteError,
-  StableTransactionError,
-  StableNetworkError,
 } from "@stablechain/sdk";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,41 +81,13 @@ function ok(structuredContent: ToolOk, text: string) {
 }
 
 /**
- * Map SDK errors to the 5 stable codes and an ACTIONABLE message. No retry logic.
- * The recovery hint goes in the `message` string (structuredContent stays {code, message}
- * so it keeps validating against each tool's outputSchema).
+ * Surface the underlying error verbatim — no custom error types, codes, or hints.
+ * Prefer the full error message (it carries the raw revert reason and any cause);
+ * fall back to String(e) for non-Error throws.
  */
 function fail(e: unknown) {
-  // viem BaseError (which StableError extends) exposes a concise `shortMessage`.
-  const base =
-    (e as { shortMessage?: string })?.shortMessage ?? (e as Error)?.message ?? String(e);
-
-  let code = "STABLE_ERROR";
-  let detail = "";
-  let hint = "Inspect the message; the inputs or network may be at fault.";
-
-  if (e instanceof StableValidationError) {
-    code = "INVALID_INPUT";
-    detail = ` (field: ${e.field}, value: ${JSON.stringify(e.value)})`;
-    hint =
-      "Fix that parameter. For chain values, fromToken/toToken addresses and decimals, call stable_list_chains.";
-  } else if (e instanceof StableQuoteError) {
-    code = "QUOTE_FAILED";
-    if (e.httpStatus) detail = ` (provider: ${e.provider}, status: ${e.httpStatus})`;
-    hint =
-      "The bridge provider could not quote. Verify fromChain/toChain, token addresses and amount, then retry stable_quote_bridge.";
-  } else if (e instanceof StableTransactionError) {
-    code = "TX_REVERTED";
-    detail = ` (phase: ${e.phase}${e.revertReason ? `, revert: ${e.revertReason}` : ""})`;
-    hint =
-      "The transaction did not settle. Check the wallet's funds with stable_balance and confirm the inputs before retrying.";
-  } else if (e instanceof StableNetworkError) {
-    code = "RPC_UNAVAILABLE";
-    hint = "The RPC/network is temporarily unreachable. Wait briefly and retry the same call.";
-  }
-
-  const message = `${base}${detail} — ${hint}`;
-  return ok({ code, message }, `${code}: ${message}`);
+  const message = (e as Error)?.message ?? String(e);
+  return ok({ message }, message);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -192,7 +160,7 @@ function registerTools(server: McpServer): void {
         "This moves real testnet funds and is irreversible; there is no confirmation step. " +
         "By default it sends native USDT0; pass `token` to send a specific ERC-20 instead. " +
         "Returns `txHash` (submitted, not necessarily finalized) — verify with stable_balance if needed. " +
-        "On failure, returns a `code` + `message` instead of a hash.",
+        "On failure, returns the raw error `message` instead of a hash.",
       inputSchema: {
         to: ADDRESS.describe("Recipient address that will receive the funds."),
         amount: AMOUNT,
@@ -203,7 +171,6 @@ function registerTools(server: McpServer): void {
       },
       outputSchema: {
         txHash: z.string().optional(),
-        code: z.string().optional(),
         message: z.string().optional(),
       },
       annotations: { destructiveHint: true },
@@ -249,7 +216,6 @@ function registerTools(server: McpServer): void {
       },
       outputSchema: {
         toAmount: z.number().optional(),
-        code: z.string().optional(),
         message: z.string().optional(),
       },
       annotations: { readOnlyHint: true },
@@ -274,7 +240,7 @@ function registerTools(server: McpServer): void {
         "Moves real testnet funds and is irreversible; call stable_quote_bridge first to confirm the expected output. " +
         "IMPORTANT: if `recipient` is omitted, the funds arrive at THIS server's own wallet on the destination chain — set `recipient` to send them elsewhere. " +
         "Returns `txHash` for the SOURCE chain only; destination settlement is asynchronous, so the funds will not appear on the destination immediately. " +
-        "On failure, returns a `code` + `message` instead.",
+        "On failure, returns the raw error `message` instead.",
       inputSchema: {
         fromChain: z
           .nativeEnum(Chain)
@@ -299,7 +265,6 @@ function registerTools(server: McpServer): void {
       outputSchema: {
         txHash: z.string().optional(),
         toAmount: z.number().optional(),
-        code: z.string().optional(),
         message: z.string().optional(),
       },
       annotations: { destructiveHint: true },
@@ -335,7 +300,6 @@ function registerTools(server: McpServer): void {
             }),
           )
           .optional(),
-        code: z.string().optional(),
         message: z.string().optional(),
       },
       annotations: { readOnlyHint: true },
@@ -360,15 +324,13 @@ function registerTools(server: McpServer): void {
     {
       title: "Read USDT balance",
       description:
-        "Read a wallet's USDT balance on the Stable chain (testnet). Read-only. " +
-        "With no arguments, returns THIS server's own wallet balance for the chain's USDT0 token — " +
+        "Read a wallet's USDT0 balance on the Stable chain (testnet). Read-only. " +
+        "With no arguments, returns THIS server's own wallet balance — " +
         "use it to check funds before stable_transfer/stable_bridge or to confirm a transfer landed. " +
-        "Returns `balance` (human-readable string) and `raw` (base units string).\n" +
-        "CAVEAT: USDT0 is dual-role — the native gas asset (18 decimals) and an ERC-20 (6 decimals) over the SAME balance. " +
-        "This reports the ERC-20 view via balanceOf (6 decimals), which can differ from the native balance by up to 0.000001 USDT0 " +
-        "due to fractional reconciliation, so a wallet holding a tiny amount can read as exactly 0 here. " +
-        "Treat this as the ERC-20 balance, not an exact native spendable amount. " +
-        "See docs: https://docs.stable.xyz/en/explanation/usdt0-behavior#balance-reconciliation",
+        "Returns `balance` (human-readable, USDT0's canonical 6 decimals) and `raw` (base units string). " +
+        "For USDT0, if the native (18-decimal) balance differs by sub-0.000001 reconciliation dust, " +
+        "a `native` field reports the full-precision figure (that dust is spendable via native transfers). " +
+        "Pass `token` to read a different ERC-20 instead.",
       inputSchema: {
         address: ADDRESS.optional().describe(
           "Wallet to read. Omit to read this server's own wallet.",
@@ -384,7 +346,11 @@ function registerTools(server: McpServer): void {
         raw: z.string().optional(),
         balance: z.string().optional(),
         decimals: z.number().optional(),
-        code: z.string().optional(),
+        // Present only for USDT0 when the native (18-decimal) balance differs from the
+        // ERC-20 view by reconciliation dust. Full-precision, actionable via native transfers.
+        native: z
+          .object({ balance: z.string(), raw: z.string(), decimals: z.number() })
+          .optional(),
         message: z.string().optional(),
       },
       annotations: { readOnlyHint: true },
@@ -393,6 +359,9 @@ function registerTools(server: McpServer): void {
       try {
         const owner = getAddress(address ?? account.address);
         const tokenAddress = getAddress(token ?? stableChainConfig.usdt);
+        const usdt0Address = getAddress(stableChainConfig.usdt);
+
+        // Primary: canonical ERC-20 balance (6 decimals) — the value wallets and explorers show.
         const decimals = tokenDecimals ?? stableChainConfig.decimals;
         const raw = await stablePublicClient.readContract({
           address: tokenAddress,
@@ -401,10 +370,29 @@ function registerTools(server: McpServer): void {
           args: [owner],
         });
         const balance = formatUnits(raw, decimals);
-        return ok(
-          { address: owner, token: tokenAddress, raw: raw.toString(), balance, decimals },
-          `${balance} USDT (${owner})`,
-        );
+        const base = { address: owner, token: tokenAddress, raw: raw.toString(), balance, decimals };
+
+        // USDT0 is dual-role (native gas asset at 18 decimals + ERC-20 at 6 over the same balance).
+        // balanceOf truncates the sub-0.000001 fraction; the native balance keeps it, and since
+        // stable_transfer is a NATIVE transfer that fraction is actually spendable. Surface the
+        // full-precision native figure ONLY when reconciliation dust makes the two diverge.
+        if (tokenAddress === usdt0Address) {
+          const nativeRaw = await stablePublicClient.getBalance({ address: owner });
+          const erc20AsNative = raw * 10n ** 12n; // 18 - 6 = 12-digit precision gap
+          if (nativeRaw !== erc20AsNative) {
+            const native = {
+              balance: formatUnits(nativeRaw, 18),
+              raw: nativeRaw.toString(),
+              decimals: 18,
+            };
+            return ok(
+              { ...base, native },
+              `${balance} USDT0 (${owner}); native full precision ${native.balance} (+reconciliation dust < 0.000001)`,
+            );
+          }
+        }
+
+        return ok(base, `${balance} USDT0 (${owner})`);
       } catch (e) {
         return fail(e);
       }
@@ -438,7 +426,6 @@ function registerTools(server: McpServer): void {
         results: z
           .array(z.object({ title: z.string(), url: z.string(), description: z.string() }))
           .optional(),
-        code: z.string().optional(),
         message: z.string().optional(),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
@@ -461,11 +448,7 @@ function registerTools(server: McpServer): void {
           .join("\n");
         return ok({ results }, text);
       } catch (e) {
-        const message = (e as Error)?.message ?? String(e);
-        return ok(
-          { code: "DOCS_UNAVAILABLE", message: `${message} — the docs index could not be loaded; retry shortly.` },
-          `DOCS_UNAVAILABLE: ${message}`,
-        );
+        return fail(e);
       }
     },
   );
@@ -489,45 +472,27 @@ function registerTools(server: McpServer): void {
         url: z.string().optional(),
         content: z.string().optional(),
         truncated: z.boolean().optional(),
-        code: z.string().optional(),
         message: z.string().optional(),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
     async ({ url }) => {
-      let parsed: URL;
       try {
-        parsed = new URL(url);
-      } catch {
-        return ok({ code: "INVALID_INPUT", message: `not a valid URL: ${url}` }, `INVALID_INPUT: not a valid URL`);
-      }
-      // Host allowlist: keep this tool a docs reader, not a general fetch primitive.
-      if (parsed.protocol !== "https:" || parsed.host !== DOCS_HOST) {
-        return ok(
-          { code: "INVALID_INPUT", message: `only https://${DOCS_HOST} pages are allowed` },
-          `INVALID_INPUT: host not allowed (${parsed.host})`,
-        );
-      }
-      if (!parsed.pathname.endsWith(".md")) parsed.pathname = `${parsed.pathname}.md`;
-      const target = parsed.toString();
-      try {
-        const res = await fetch(target);
-        if (!res.ok) {
-          return ok(
-            { code: "DOCS_UNAVAILABLE", message: `HTTP ${res.status} fetching ${target}` },
-            `DOCS_UNAVAILABLE: HTTP ${res.status}`,
-          );
+        const parsed = new URL(url);
+        // Host allowlist: keep this tool a docs reader, not a general fetch primitive.
+        if (parsed.protocol !== "https:" || parsed.host !== DOCS_HOST) {
+          throw new Error(`only https://${DOCS_HOST} pages are allowed (got ${parsed.host})`);
         }
+        if (!parsed.pathname.endsWith(".md")) parsed.pathname = `${parsed.pathname}.md`;
+        const target = parsed.toString();
+        const res = await fetch(target);
+        if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${target}`);
         let content = await res.text();
         const truncated = content.length > DOC_MAX_CHARS;
         if (truncated) content = `${content.slice(0, DOC_MAX_CHARS)}\n\n[truncated]`;
         return ok({ url: target, content, truncated }, content);
       } catch (e) {
-        const message = (e as Error)?.message ?? String(e);
-        return ok(
-          { code: "DOCS_UNAVAILABLE", message: `${message} — could not fetch the page; retry shortly.` },
-          `DOCS_UNAVAILABLE: ${message}`,
-        );
+        return fail(e);
       }
     },
   );
